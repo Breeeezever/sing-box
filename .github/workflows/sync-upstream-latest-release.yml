@@ -1,0 +1,96 @@
+name: Sync latest upstream release
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: sync-latest-upstream-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      UPSTREAM_REPO: SagerNet/sing-box
+      TARGET_REPO: ${{ github.repository }}
+    steps:
+      - name: Sync latest stable release
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "Checking ${UPSTREAM_REPO}..."
+          release_json="$(gh api "repos/${UPSTREAM_REPO}/releases/latest" 2>/dev/null || true)"
+          if [[ -z "${release_json}" ]] || ! jq -e '.tag_name' >/dev/null 2>&1 <<<"${release_json}"; then
+            echo "No published stable release on upstream; nothing to sync."
+            exit 0
+          fi
+
+          tag="$(jq -r '.tag_name' <<<"${release_json}")"
+          title="$(jq -r '(.name // .tag_name)' <<<"${release_json}")"
+          body="$(jq -r '(.body // "")' <<<"${release_json}")"
+          echo "Latest upstream release: ${tag}"
+
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "${tmp}"' EXIT
+
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          gh auth setup-git
+          mkdir -p "${tmp}/repo"
+          git -C "${tmp}/repo" init -q
+          git -C "${tmp}/repo" remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git -C "${tmp}/repo" remote add origin "https://github.com/${TARGET_REPO}.git"
+
+          if ! git -C "${tmp}/repo" ls-remote --exit-code --refs origin "refs/tags/${tag}" >/dev/null 2>&1; then
+            git -C "${tmp}/repo" fetch --quiet upstream "refs/tags/${tag}:refs/tags/${tag}"
+            git -C "${tmp}/repo" push --quiet origin "refs/tags/${tag}:refs/tags/${tag}"
+            echo "Pushed tag ${tag}."
+          else
+            echo "Tag ${tag} already exists in target."
+          fi
+
+          assets_dir="${tmp}/assets"
+          mkdir -p "${assets_dir}"
+          gh release download "${tag}" \
+            --repo "${UPSTREAM_REPO}" \
+            --dir "${assets_dir}" \
+            --clobber || true
+
+          assets=()
+          while IFS= read -r -d '' file; do
+            assets+=( "$file" )
+          done < <(find "${assets_dir}" -maxdepth 1 -type f -print0)
+
+          if gh release view "${tag}" --repo "${TARGET_REPO}" >/dev/null 2>&1; then
+            gh release edit "${tag}" \
+              --repo "${TARGET_REPO}" \
+              --title "${title}" \
+              --notes "${body}"
+            if (( ${#assets[@]} > 0 )); then
+              gh release upload "${tag}" \
+                --repo "${TARGET_REPO}" \
+                --clobber \
+                "${assets[@]}"
+            fi
+            echo "Updated target release ${tag}."
+          else
+            args=(
+              "${tag}"
+              --repo "${TARGET_REPO}"
+              --title "${title}"
+              --notes "${body}"
+            )
+            if (( ${#assets[@]} > 0 )); then
+              args+=( "${assets[@]}" )
+            fi
+            gh release create "${args[@]}"
+            echo "Created target release ${tag}."
+          fi
