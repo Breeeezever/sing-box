@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
-      GH_TOKEN: ${{ github.token }}
+      GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
       UPSTREAM_REPO: SagerNet/sing-box
       TARGET_REPO: ${{ github.repository }}
     steps:
@@ -38,25 +38,22 @@ jobs:
           body="$(jq -r '(.body // "")' <<<"${release_json}")"
           echo "Latest upstream release: ${tag}"
 
-          tmp="$(mktemp -d)"
-          trap 'rm -rf "${tmp}"' EXIT
-
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          gh auth setup-git
-          mkdir -p "${tmp}/repo"
-          git -C "${tmp}/repo" init -q
-          git -C "${tmp}/repo" remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
-          git -C "${tmp}/repo" remote add origin "https://github.com/${TARGET_REPO}.git"
-
-          if ! git -C "${tmp}/repo" ls-remote --exit-code --refs origin "refs/tags/${tag}" >/dev/null 2>&1; then
-            git -C "${tmp}/repo" fetch --quiet upstream "refs/tags/${tag}:refs/tags/${tag}"
-            git -C "${tmp}/repo" push --quiet origin "refs/tags/${tag}:refs/tags/${tag}"
-            echo "Pushed tag ${tag}."
+          upstream_ref="$(gh api "repos/${UPSTREAM_REPO}/git/ref/tags/${tag}")"
+          object_sha="$(jq -r '.object.sha' <<<"${upstream_ref}")"
+          object_type="$(jq -r '.object.type' <<<"${upstream_ref}")"
+          if [[ "${object_type}" == "tag" ]]; then
+            commit_sha="$(gh api "repos/${UPSTREAM_REPO}/git/tags/${object_sha}" --jq '.object.sha')"
           else
-            echo "Tag ${tag} already exists in target."
+            commit_sha="${object_sha}"
           fi
 
+          target_tag_exists=true
+          if ! gh api "repos/${TARGET_REPO}/git/ref/tags/${tag}" >/dev/null 2>&1; then
+            target_tag_exists=false
+          fi
+
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "${tmp}"' EXIT
           assets_dir="${tmp}/assets"
           mkdir -p "${assets_dir}"
           gh release download "${tag}" \
@@ -88,6 +85,9 @@ jobs:
               --title "${title}"
               --notes "${body}"
             )
+            if [[ "${target_tag_exists}" == false ]]; then
+              args+=( --target "${commit_sha}" )
+            fi
             if (( ${#assets[@]} > 0 )); then
               args+=( "${assets[@]}" )
             fi
