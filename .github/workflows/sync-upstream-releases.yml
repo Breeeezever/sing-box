@@ -42,14 +42,67 @@ jobs:
             done
           }
 
+          retry_capture() {
+            local attempt=1
+            local max_attempts=3
+            local delay=10
+            local output
+            while true; do
+              if output="$("$@")"; then
+                printf '%s' "${output}"
+                return 0
+              fi
+              if (( attempt >= max_attempts )); then
+                echo "Command failed after ${attempt} attempts: $*" >&2
+                return 1
+              fi
+              echo "Attempt ${attempt} failed; retrying in ${delay}s: $*" >&2
+              sleep "${delay}"
+              attempt=$((attempt + 1))
+              delay=$((delay * 2))
+            done
+          }
+
+          fetch_target_release() {
+            local tag="$1"
+            local attempt=1
+            local max_attempts=3
+            local delay=10
+            local output error_file
+            error_file="$(mktemp)"
+
+            while true; do
+              if output="$(gh api "repos/${TARGET_REPO}/releases/tags/${tag}" 2>"${error_file}")"; then
+                rm -f "${error_file}"
+                printf '%s' "${output}"
+                return 0
+              fi
+
+              if grep -q 'HTTP 404' "${error_file}"; then
+                rm -f "${error_file}"
+                return 4
+              fi
+
+              cat "${error_file}" >&2
+              if (( attempt >= max_attempts )); then
+                rm -f "${error_file}"
+                return 1
+              fi
+              echo "Release lookup attempt ${attempt} failed; retrying in ${delay}s." >&2
+              sleep "${delay}"
+              attempt=$((attempt + 1))
+              delay=$((delay * 2))
+            done
+          }
+
           resolve_commit_sha() {
             local tag="$1"
             local ref_json object_sha object_type tag_json
-            ref_json="$(gh api "repos/${UPSTREAM_REPO}/git/ref/tags/${tag}")"
+            ref_json="$(retry_capture gh api "repos/${UPSTREAM_REPO}/git/ref/tags/${tag}")"
             object_sha="$(jq -r '.object.sha' <<<"${ref_json}")"
             object_type="$(jq -r '.object.type' <<<"${ref_json}")"
             while [[ "${object_type}" == "tag" ]]; do
-              tag_json="$(gh api "repos/${UPSTREAM_REPO}/git/tags/${object_sha}")"
+              tag_json="$(retry_capture gh api "repos/${UPSTREAM_REPO}/git/tags/${object_sha}")"
               object_sha="$(jq -r '.object.sha' <<<"${tag_json}")"
               object_type="$(jq -r '.object.type' <<<"${tag_json}")"
             done
@@ -63,7 +116,7 @@ jobs:
           sync_release() {
             local release_json="$1"
             local tag title body prerelease commit_sha upstream_asset_count
-            local target_json target_asset_count upstream_signature target_signature
+            local target_json target_asset_count upstream_signature target_signature fetch_status
             local release_tmp notes_file assets_dir
             local -a assets state_args create_args
 
@@ -83,7 +136,7 @@ jobs:
             mkdir -p "${assets_dir}"
             printf '%s' "${body}" >"${notes_file}"
 
-            if target_json="$(gh api "repos/${TARGET_REPO}/releases/tags/${tag}" 2>/dev/null)"; then
+            if target_json="$(fetch_target_release "${tag}")"; then
               target_asset_count="$(jq -r '.assets | length' <<<"${target_json}")"
               target_signature="$(asset_signature <<<"${target_json}")"
 
@@ -126,6 +179,12 @@ jobs:
               fi
               echo "Updated ${tag}."
             else
+              fetch_status=$?
+              if [[ "${fetch_status}" -ne 4 ]]; then
+                echo "Unable to determine whether ${tag} exists in the target repository." >&2
+                return "${fetch_status}"
+              fi
+
               commit_sha="$(resolve_commit_sha "${tag}")"
               echo "Creating ${tag} at ${commit_sha}."
 
@@ -166,7 +225,7 @@ jobs:
           }
 
           echo "Checking release channels from ${UPSTREAM_REPO}..."
-          releases_json="$(gh api "repos/${UPSTREAM_REPO}/releases?per_page=100")"
+          releases_json="$(retry_capture gh api "repos/${UPSTREAM_REPO}/releases?per_page=20")"
 
           candidates="$({
             jq -c '
@@ -198,3 +257,5 @@ jobs:
           while IFS= read -r release; do
             sync_release "${release}"
           done < <(jq -c '.[]' <<<"${candidates}")
+
+
