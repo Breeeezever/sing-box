@@ -1,0 +1,200 @@
+name: Sync upstream releases
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: sync-upstream-releases
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+      UPSTREAM_REPO: SagerNet/sing-box
+      TARGET_REPO: ${{ github.repository }}
+    steps:
+      - name: Sync stable and prerelease channels
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          retry() {
+            local attempt=1
+            local max_attempts=3
+            local delay=10
+            until "$@"; do
+              if (( attempt >= max_attempts )); then
+                echo "Command failed after ${attempt} attempts: $*" >&2
+                return 1
+              fi
+              echo "Attempt ${attempt} failed; retrying in ${delay}s: $*" >&2
+              sleep "${delay}"
+              attempt=$((attempt + 1))
+              delay=$((delay * 2))
+            done
+          }
+
+          resolve_commit_sha() {
+            local tag="$1"
+            local ref_json object_sha object_type tag_json
+            ref_json="$(gh api "repos/${UPSTREAM_REPO}/git/ref/tags/${tag}")"
+            object_sha="$(jq -r '.object.sha' <<<"${ref_json}")"
+            object_type="$(jq -r '.object.type' <<<"${ref_json}")"
+            while [[ "${object_type}" == "tag" ]]; do
+              tag_json="$(gh api "repos/${UPSTREAM_REPO}/git/tags/${object_sha}")"
+              object_sha="$(jq -r '.object.sha' <<<"${tag_json}")"
+              object_type="$(jq -r '.object.type' <<<"${tag_json}")"
+            done
+            printf '%s' "${object_sha}"
+          }
+
+          asset_signature() {
+            jq -r '[.assets[] | "\(.name):\(.size)"] | sort | join("\n")'
+          }
+
+          sync_release() {
+            local release_json="$1"
+            local tag title body prerelease commit_sha upstream_asset_count
+            local target_json target_asset_count upstream_signature target_signature
+            local release_tmp notes_file assets_dir
+            local -a assets state_args create_args
+
+            tag="$(jq -r '.tag_name' <<<"${release_json}")"
+            title="$(jq -r 'if (.name // "") == "" then .tag_name else .name end' <<<"${release_json}")"
+            body="$(jq -r '.body // ""' <<<"${release_json}")"
+            prerelease="$(jq -r '.prerelease' <<<"${release_json}")"
+            upstream_asset_count="$(jq -r '.assets | length' <<<"${release_json}")"
+            upstream_signature="$(asset_signature <<<"${release_json}")"
+
+            echo "::group::Sync ${tag}"
+            echo "Channel: $([[ "${prerelease}" == "true" ]] && echo prerelease || echo stable); upstream assets: ${upstream_asset_count}"
+
+            release_tmp="$(mktemp -d)"
+            notes_file="${release_tmp}/notes.md"
+            assets_dir="${release_tmp}/assets"
+            mkdir -p "${assets_dir}"
+            printf '%s' "${body}" >"${notes_file}"
+
+            if target_json="$(gh api "repos/${TARGET_REPO}/releases/tags/${tag}" 2>/dev/null)"; then
+              target_asset_count="$(jq -r '.assets | length' <<<"${target_json}")"
+              target_signature="$(asset_signature <<<"${target_json}")"
+
+              state_args=(--prerelease=false)
+              if [[ "${prerelease}" == "true" ]]; then
+                state_args=(--prerelease --latest=false)
+              else
+                state_args+=(--latest)
+              fi
+
+              retry gh release edit "${tag}" \
+                --repo "${TARGET_REPO}" \
+                --title "${title}" \
+                --notes-file "${notes_file}" \
+                "${state_args[@]}"
+
+              if [[ "${upstream_signature}" == "${target_signature}" ]]; then
+                echo "Assets already match (${target_asset_count}); metadata refreshed."
+                rm -rf "${release_tmp}"
+                echo "::endgroup::"
+                return 0
+              fi
+
+              echo "Asset set differs (target ${target_asset_count}, upstream ${upstream_asset_count}); refreshing assets."
+              retry gh release download "${tag}" \
+                --repo "${UPSTREAM_REPO}" \
+                --dir "${assets_dir}" \
+                --clobber
+
+              assets=()
+              while IFS= read -r -d '' file; do
+                assets+=("${file}")
+              done < <(find "${assets_dir}" -maxdepth 1 -type f -print0)
+
+              if (( ${#assets[@]} > 0 )); then
+                retry gh release upload "${tag}" \
+                  --repo "${TARGET_REPO}" \
+                  --clobber \
+                  "${assets[@]}"
+              fi
+              echo "Updated ${tag}."
+            else
+              commit_sha="$(resolve_commit_sha "${tag}")"
+              echo "Creating ${tag} at ${commit_sha}."
+
+              if (( upstream_asset_count > 0 )); then
+                retry gh release download "${tag}" \
+                  --repo "${UPSTREAM_REPO}" \
+                  --dir "${assets_dir}" \
+                  --clobber
+              fi
+
+              assets=()
+              while IFS= read -r -d '' file; do
+                assets+=("${file}")
+              done < <(find "${assets_dir}" -maxdepth 1 -type f -print0)
+
+              create_args=(
+                "${tag}"
+                --repo "${TARGET_REPO}"
+                --target "${commit_sha}"
+                --title "${title}"
+                --notes-file "${notes_file}"
+              )
+              if [[ "${prerelease}" == "true" ]]; then
+                create_args+=(--prerelease --latest=false)
+              else
+                create_args+=(--latest)
+              fi
+              if (( ${#assets[@]} > 0 )); then
+                create_args+=("${assets[@]}")
+              fi
+
+              retry gh release create "${create_args[@]}"
+              echo "Created ${tag}."
+            fi
+
+            rm -rf "${release_tmp}"
+            echo "::endgroup::"
+          }
+
+          echo "Checking release channels from ${UPSTREAM_REPO}..."
+          releases_json="$(gh api "repos/${UPSTREAM_REPO}/releases?per_page=100")"
+
+          candidates="$({
+            jq -c '
+              [
+                ([.[] | select((.draft | not) and (.prerelease | not))][0] // null),
+                ([.[] | select((.draft | not) and .prerelease and (.tag_name | test("(?i)(^|[.-])alpha([.-]|$)")))][0] // null),
+                ([.[] | select((.draft | not) and .prerelease and (.tag_name | test("(?i)(^|[.-])beta([.-]|$)")))][0] // null),
+                ([.[] | select((.draft | not) and .prerelease and (.tag_name | test("(?i)(^|[.-])rc([.-]|$)")))][0] // null),
+                ([.[] | select((.draft | not) and .prerelease)][0] // null)
+              ]
+              | reduce .[] as $release (
+                  [];
+                  if $release == null or any(.[]; .tag_name == $release.tag_name)
+                  then .
+                  else . + [$release]
+                  end
+                )
+            ' <<<"${releases_json}"
+          })"
+
+          if [[ "$(jq 'length' <<<"${candidates}")" -eq 0 ]]; then
+            echo "No published releases found."
+            exit 0
+          fi
+
+          echo "Selected channels:"
+          jq -r '.[] | "- \(.tag_name) (prerelease=\(.prerelease))"' <<<"${candidates}"
+
+          while IFS= read -r release; do
+            sync_release "${release}"
+          done < <(jq -c '.[]' <<<"${candidates}")
