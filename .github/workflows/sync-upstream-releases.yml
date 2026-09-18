@@ -2,7 +2,7 @@ name: Sync upstream releases
 
 on:
   schedule:
-    - cron: "23 */6 * * *"
+    - cron: "17 3 * * *"
   workflow_dispatch:
 
 concurrency:
