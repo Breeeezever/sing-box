@@ -1,0 +1,81 @@
+name: Sync upstream (anchored)
+
+on:
+  schedule:
+    - cron: "5 15 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-anchored
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: "SagerNet/sing-box"
+  UPSTREAM_BRANCH: "testing"
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Backup anchor (tag current state)
+        run: |
+          TAG="backup/$(date -u +%Y-%m-%d)"
+          if git ls-remote --exit-code origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "Anchor $TAG already exists, skip."
+          else
+            git tag "$TAG"
+            git push origin "$TAG"
+            echo "Anchor created: $TAG -> $(git rev-parse HEAD)"
+          fi
+
+      - name: Guard checks
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM}.git"
+          git fetch upstream "$UPSTREAM_BRANCH"
+          if ! git merge-base HEAD "upstream/$UPSTREAM_BRANCH" >/dev/null 2>&1; then
+            echo "::error::No common ancestor - upstream history may have been rewritten, aborting."; exit 1
+          fi
+          BEFORE=$(git ls-tree -r --name-only HEAD | wc -l)
+          AFTER=$(git ls-tree -r --name-only "upstream/$UPSTREAM_BRANCH" | wc -l)
+          echo "File count: $BEFORE -> $AFTER"
+          if [ "$BEFORE" -gt 5 ] && [ "$AFTER" -lt $((BEFORE * 30 / 100)) ]; then
+            echo "::error::File count dropped sharply $BEFORE -> $AFTER - upstream branch may have been wiped, aborting."; exit 1
+          fi
+
+      - name: Merge upstream (merge-only, workflows frozen)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git merge --no-ff --no-edit "upstream/$UPSTREAM_BRANCH" 2>/tmp/merge-err; then
+            echo "Merged upstream cleanly."
+          else
+            CONFLICTS=$(git diff --name-only --diff-filter=U)
+            NON_WF=$(echo "$CONFLICTS" | grep -v '^\.github/workflows/' || true)
+            if [ -n "$NON_WF" ]; then
+              echo "::error::Non-workflow conflicts, manual handling needed: $NON_WF"
+              exit 1
+            fi
+            git checkout --ours -- .github/workflows 2>/dev/null || true
+            git add -A .github/workflows
+            git merge --continue
+          fi
+          # GITHUB_TOKEN 无法修改 workflow 文件：将 .github/workflows 整体冻结在 fork 当前版本
+          # （包括上游新增的 workflow 文件也要剔除，否则 push 仍会被拒绝）
+          # 1) delete workflow files added upstream but absent in fork pre-merge
+          git diff-tree -r --name-only --diff-filter=A "HEAD~1" HEAD -- .github/workflows | while read -r f; do
+            [ -n "$f" ] && git rm -q -f "$f"
+          done
+          # 2) restore all workflow file contents to fork pre-merge state
+          git checkout "HEAD~1" -- .github/workflows 2>/dev/null || true
+          if ! git diff --quiet HEAD; then
+            git commit --amend --no-edit >/dev/null
+          fi
+          git push origin "HEAD:${{ github.ref_name }}"
