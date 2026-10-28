@@ -2,7 +2,7 @@ name: Mirror upstream releases
 
 on:
   schedule:
-    - cron: "40 6 * * *"
+    - cron: "10 16 * * *"
   workflow_dispatch:
     inputs:
       tags:
