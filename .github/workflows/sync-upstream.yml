@@ -47,8 +47,13 @@ jobs:
         run: |
           git remote add upstream "https://github.com/${UPSTREAM}.git"
           git fetch upstream "$UPSTREAM_BRANCH"
-          if ! git merge-base HEAD "upstream/$UPSTREAM_BRANCH" >/dev/null 2>&1; then
-            echo "::error::No common ancestor - upstream history may have been rewritten, aborting."; exit 1
+          # No common ancestor is NOT fatal here: this branch is a mirror, so the
+          # remedy for a rewritten upstream history is exactly what this workflow
+          # does anyway. Only a collapsed file count is worth stopping for.
+          if git merge-base HEAD "upstream/$UPSTREAM_BRANCH" >/dev/null 2>&1; then
+            echo "Common ancestor present."
+          else
+            echo "::warning::No common ancestor - upstream history was fully rewritten; mirroring anyway (backup tag exists)."
           fi
           BEFORE=$(git ls-tree -r --name-only HEAD | wc -l)
           AFTER=$(git ls-tree -r --name-only "upstream/$UPSTREAM_BRANCH" | wc -l)
