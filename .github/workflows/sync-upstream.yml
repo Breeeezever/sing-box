@@ -1,0 +1,96 @@
+name: Sync upstream (mirror)
+
+# This fork carries no local content besides its own frozen .github/workflows.
+# SagerNet rebases `testing` periodically (2026-10-11, 2026-10-23), which gives
+# every shared commit a new SHA; a merge-only sync therefore "conflicts" on dozens
+# of files that are not actually different and fails nightly for no reason.
+# A mirror wants exactly upstream's tree, so this workflow adopts it outright.
+# Undo is always available: the backup/<date> tag points at the pre-sync state.
+
+on:
+  schedule:
+    - cron: "59 15 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-mirror
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: "SagerNet/sing-box"
+  UPSTREAM_BRANCH: "testing"
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Backup anchor (tag current state)
+        run: |
+          TAG="backup/$(date -u +%Y-%m-%d)"
+          if git ls-remote --exit-code origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "Anchor $TAG already exists, skip."
+          else
+            git tag "$TAG"
+            git push origin "$TAG"
+            echo "Anchor created: $TAG -> $(git rev-parse HEAD)"
+          fi
+
+      - name: Guard checks
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM}.git"
+          git fetch upstream "$UPSTREAM_BRANCH"
+          if ! git merge-base HEAD "upstream/$UPSTREAM_BRANCH" >/dev/null 2>&1; then
+            echo "::error::No common ancestor - upstream history may have been rewritten, aborting."; exit 1
+          fi
+          BEFORE=$(git ls-tree -r --name-only HEAD | wc -l)
+          AFTER=$(git ls-tree -r --name-only "upstream/$UPSTREAM_BRANCH" | wc -l)
+          echo "File count: $BEFORE -> $AFTER"
+          if [ "$BEFORE" -gt 5 ] && [ "$AFTER" -lt $((BEFORE * 30 / 100)) ]; then
+            echo "::error::File count dropped sharply $BEFORE -> $AFTER - upstream branch may have been wiped, aborting."; exit 1
+          fi
+
+      - name: Adopt upstream tree, keep fork workflows frozen
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          UP="upstream/$UPSTREAM_BRANCH"
+          OUT=":(exclude).github/workflows"
+
+          if git diff --quiet "$UP" HEAD -- . "$OUT"; then
+            echo "Content already matches upstream."
+            exit 0
+          fi
+
+          # .github/workflows is frozen for this fork and must survive the reset.
+          FROZEN="$RUNNER_TEMP/wf-frozen"
+          rm -rf "$FROZEN" && mkdir -p "$FROZEN"
+          cp -a .github/workflows/. "$FROZEN/"
+
+          echo "Resetting to upstream $(git rev-parse --short "$UP")."
+          git reset --hard "$UP"
+
+          rm -rf .github/workflows && mkdir -p .github/workflows
+          cp -a "$FROZEN/." .github/workflows/
+          git add -A .github/workflows
+          if git diff --quiet --cached; then
+            echo "freeze: workflow directory unchanged"
+          else
+            git commit --no-edit -m "ci: keep fork workflows frozen"
+          fi
+
+          if git diff --quiet "$UP" HEAD -- . "$OUT"; then
+            echo "Tree outside .github/workflows matches upstream."
+          else
+            echo "::error::tree outside .github/workflows still differs from upstream"; exit 1
+          fi
+
+          git push origin "HEAD:${{ github.ref_name }}" --force-with-lease
