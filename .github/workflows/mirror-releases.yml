@@ -1,0 +1,120 @@
+name: Mirror upstream releases
+
+on:
+  schedule:
+    - cron: "40 6 * * *"
+  workflow_dispatch:
+    inputs:
+      tags:
+        description: "Space separated upstream tags to mirror (empty = newest stable + newest prerelease)"
+        required: false
+        default: ""
+      max_mb:
+        description: "Per-run transfer budget in MB; the run stops cleanly when exhausted and resumes next time"
+        required: false
+        default: "26000"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mirror-releases
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: "SagerNet/sing-box"
+  BATCH: "6"
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Resolve target tags
+        id: resolve
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED: ${{ inputs.tags }}
+        run: |
+          set -euo pipefail
+          if [ -n "$(printf '%s' "${REQUESTED}" | tr -d ' ')" ]; then
+            printf 'tags=%s\n' "${REQUESTED}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Upstream keeps 600+ releases at ~5.8GB of assets each, so a full mirror is
+          # impossible. Steady state chases only the newest stable and the newest
+          # prerelease; older gaps stay unfilled unless passed in through `tags`.
+          gh api "repos/${UPSTREAM}/releases?per_page=30" > upstream.json
+          STABLE=$(jq -r '[.[] | select(.draft == false and .prerelease == false)][0].tag_name // ""' upstream.json)
+          PRE=$(jq -r '[.[] | select(.draft == false and .prerelease == true)][0].tag_name // ""' upstream.json)
+          printf 'tags=%s %s\n' "${STABLE}" "${PRE}" >> "$GITHUB_OUTPUT"
+          echo "Resolved: stable=${STABLE} prerelease=${PRE}"
+
+      - name: Mirror releases (resumable at asset level)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ github.repository }}
+          TAGS: ${{ steps.resolve.outputs.tags }}
+          MAX_MB: ${{ inputs.max_mb || '26000' }}
+        run: |
+          set -euo pipefail
+          mkdir -p stage
+          USED=0
+
+          for tag in $TAGS; do
+            [ -z "$tag" ] && continue
+            echo "=== ${tag} ==="
+            gh api "repos/${UPSTREAM}/releases/tags/${tag}" > rel.json
+
+            if gh release view "$tag" --repo "$TARGET" --json assets > have.json 2>/dev/null; then
+              echo "Release exists, reconciling assets."
+            else
+              TITLE=$(jq -r '.name // .tag_name' rel.json)
+              jq -r '.body // ""' rel.json > notes.md
+              ARGS=("$tag" --repo "$TARGET" --title "$TITLE" --notes-file notes.md)
+              [ "$(jq -r '.prerelease' rel.json)" = "true" ] && ARGS+=(--prerelease)
+              gh release create "${ARGS[@]}"
+              printf '{"assets":[]}\n' > have.json
+            fi
+
+            jq -r '.assets[].name' have.json | sort > have.txt
+            jq -r '.assets[] | select(.state == "uploaded") | [.browser_download_url, .name, .size] | @tsv' rel.json > want.tsv
+            cut -f2 want.tsv | sort > want-names.txt
+            comm -13 have.txt want-names.txt > missing.txt
+            echo "Assets: want=$(wc -l < want-names.txt) have=$(wc -l < have.txt) missing=$(wc -l < missing.txt)"
+
+            # One release is ~5.8GB, far beyond the runner's free disk, so assets are
+            # streamed through a small staging dir in batches of $BATCH and uploaded
+            # batch by batch. Assets already present are skipped, which makes the
+            # whole pass resumable across re-runs and across rate-limit failures.
+            rm -f chunk-*
+            split -l "$BATCH" -d -a 4 missing.txt chunk- 2>/dev/null || true
+            for chunk in chunk-*; do
+              [ -e "$chunk" ] || continue
+              BATCH_MB=0
+              while read -r fn; do
+                [ -z "$fn" ] && continue
+                url=$(awk -F'\t' -v n="$fn" '$2 == n {print $1; exit}' want.tsv)
+                size=$(awk -F'\t' -v n="$fn" '$2 == n {print $3; exit}' want.tsv)
+                SIZE_MB=$(( ${size:-0} / 1048576 + 1 ))
+                if [ $(( USED + BATCH_MB + SIZE_MB )) -gt "$MAX_MB" ]; then
+                  echo "Budget ${MAX_MB}MB reached after ~$(( USED + BATCH_MB ))MB; stopping, a re-run continues."
+                  exit 0
+                fi
+                echo "  download ${fn} (${SIZE_MB}MB)"
+                curl -fL --retry 3 --retry-delay 5 --connect-timeout 30 -o "stage/${fn}" "$url"
+                BATCH_MB=$(( BATCH_MB + SIZE_MB ))
+              done < "$chunk"
+              echo "  upload batch (${BATCH_MB}MB)"
+              if compgen -G "stage/*" >/dev/null; then
+                gh release upload "$tag" stage/* --repo "$TARGET" --clobber
+              fi
+              rm -f stage/* "$chunk"
+              USED=$(( USED + BATCH_MB ))
+            done
+            sleep 5
+          done
+
+          echo "Mirror pass complete. Transferred ~${USED}MB."
